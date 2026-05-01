@@ -5,14 +5,35 @@ communication-agent, inbox-sorting-agent).
 
 ## Resolution semantics
 
-`FeatureFlagService` is **strict-AND** and **fail-closed**:
+`FeatureFlagService` uses **mailbox-overrides-tenant** semantics and is
+**fail-closed**:
 
-1. The tenant-wide row (`mailbox_address = ''`) must exist AND be `enabled = True`.
-2. If a mailbox is provided, the per-mailbox row must ALSO exist AND be enabled.
-3. Any missing row, disabled value, or DB error → `False`.
-4. Mailbox matching is case-insensitive.
-5. Configs are shallow-merged (`{**tenant.config, **mailbox.config}`) so per-mailbox
+1. If a mailbox is supplied AND a per-mailbox row exists, that row's `enabled`
+   value wins (regardless of the tenant-wide row).
+2. Otherwise, the tenant-wide row (`mailbox_address = ''`) decides.
+3. If neither row exists → `False` (fail-closed).
+4. Any DB error → `False`.
+5. Mailbox matching is case-insensitive.
+6. Configs are shallow-merged (`{**tenant.config, **mailbox.config}`) so per-mailbox
    keys override tenant defaults.
+
+### Truth table
+
+| tenant row | mailbox row | resolved |
+|------------|-------------|----------|
+| missing    | missing     | `False`  |
+| missing    | OFF         | `False`  |
+| missing    | ON          | `True`   |
+| OFF        | missing     | `False`  |
+| OFF        | OFF         | `False`  |
+| OFF        | ON          | `True`   |
+| ON         | missing     | `True`   |
+| ON         | OFF         | `False`  |
+| ON         | ON          | `True`   |
+
+This is more useful than strict-AND: a single mailbox can opt into a flag
+without a tenant-wide row, and a per-mailbox kill-switch still works while the
+tenant is ON.
 
 A 60-second in-process TTL cache is keyed on
 `(flag_name, lower(mailbox_address or ''))`. Errors are NOT cached, so a flag
@@ -26,7 +47,7 @@ The library expects a `feature_flags` table with at least:
 |-------------------|-----------|--------------------------------------------------|
 | `flag_name`       | `text`    | e.g. `"new_planner_routing"`                     |
 | `mailbox_address` | `text`    | empty string `''` for tenant-wide row            |
-| `enabled`         | `boolean` | both rows must be true for `is_enabled` to pass  |
+| `enabled`         | `boolean` | mailbox row (if present) overrides tenant row    |
 | `config`          | `jsonb`   | optional per-flag config; merged across rows     |
 
 ## Usage
@@ -59,7 +80,7 @@ Pin to a tag via Git URL in your service's `pyproject.toml`:
 ```toml
 [project]
 dependencies = [
-    "agentee-feature-flags @ git+https://github.com/agenteeio/agentee-feature-flags.git@v0.1.0",
+    "agentee-feature-flags @ git+https://github.com/agenteeio/agentee-feature-flags.git@v0.2.0",
 ]
 ```
 

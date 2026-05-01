@@ -1,14 +1,19 @@
 """Unit tests for feature_flags.service.FeatureFlagService — 100% coverage.
 
-Resolution truth-table:
-    | global | mailbox | result |
+Resolution truth-table (override semantics — mailbox row wins over tenant):
+    | tenant | mailbox | result |
     |--------|---------|--------|
-    |   -    |   any   | False  |  (row absent)
-    |  OFF   |   any   | False  |  (global disabled)
-    |   ON   |   N/A   | True   |  (no mailbox supplied, global ON)
-    |   ON   |    -    | False  |  (mailbox row absent)
-    |   ON   |  OFF    | False  |  (mailbox row disabled)
-    |   ON   |   ON    | True   |  (both enabled)
+    |   -    |   -     | False  |  (no rows at all)
+    |   -    |  OFF    | False  |  (mailbox row decides)
+    |   -    |   ON    | True   |  (mailbox can opt-in alone)
+    |  OFF   |   -     | False  |  (tenant row decides)
+    |  OFF   |  OFF    | False  |  (mailbox row decides)
+    |  OFF   |   ON    | True   |  (mailbox overrides tenant OFF)
+    |   ON   |   -     | True   |  (tenant default applies)
+    |   ON   |  OFF    | False  |  (per-mailbox kill-switch)
+    |   ON   |   ON    | True   |  (both ON)
+
+Plus: no-mailbox calls obey the tenant row (missing/OFF/ON).
 
 Covers:
     - is_enabled() — all truth-table paths
@@ -76,40 +81,72 @@ def _make_pool(
 
 
 @pytest.mark.asyncio
-async def test_no_tenant_row_returns_false() -> None:
-    """Global row absent → False regardless of mailbox."""
+async def test_no_rows_returns_false() -> None:
+    """Neither tenant nor mailbox row exists → False (fail-closed)."""
     clear_flag_cache()
-    svc = FeatureFlagService(_make_pool(tenant_row=None))
+    svc = FeatureFlagService(_make_pool(tenant_row=None, mailbox_row=None))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
 
 
 @pytest.mark.asyncio
-async def test_tenant_row_disabled_returns_false() -> None:
-    """Global row enabled=False → False (kill-switch)."""
+async def test_tenant_missing_mailbox_off_returns_false() -> None:
+    """Tenant row missing, mailbox OFF → False (mailbox row decides)."""
+    clear_flag_cache()
+    svc = FeatureFlagService(_make_pool(tenant_row=None, mailbox_row=_row(False)))
+    assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
+
+
+@pytest.mark.asyncio
+async def test_tenant_missing_mailbox_on_returns_true() -> None:
+    """Tenant row missing, mailbox ON → True (mailbox can opt-in alone)."""
+    clear_flag_cache()
+    svc = FeatureFlagService(_make_pool(tenant_row=None, mailbox_row=_row(True)))
+    assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
+
+
+@pytest.mark.asyncio
+async def test_tenant_off_no_mailbox_returns_false() -> None:
+    """Tenant OFF, no mailbox supplied → False (tenant row decides)."""
     clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(False)))
+    assert await svc.is_enabled("auto_execute.invoice_v1") is False
+
+
+@pytest.mark.asyncio
+async def test_tenant_off_mailbox_off_returns_false() -> None:
+    """Tenant OFF, mailbox OFF → False (mailbox row decides — and it's OFF)."""
+    clear_flag_cache()
+    svc = FeatureFlagService(_make_pool(tenant_row=_row(False), mailbox_row=_row(False)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
 
 
 @pytest.mark.asyncio
-async def test_global_on_no_mailbox_returns_true() -> None:
-    """Global ON and no mailbox supplied → True (mailbox gate skipped)."""
+async def test_tenant_off_mailbox_on_returns_true() -> None:
+    """Tenant OFF, mailbox ON → True (mailbox overrides tenant OFF)."""
+    clear_flag_cache()
+    svc = FeatureFlagService(_make_pool(tenant_row=_row(False), mailbox_row=_row(True)))
+    assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
+
+
+@pytest.mark.asyncio
+async def test_tenant_on_no_mailbox_returns_true() -> None:
+    """Tenant ON and no mailbox supplied → True."""
     clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True)))
     assert await svc.is_enabled("auto_execute.invoice_v1") is True
 
 
 @pytest.mark.asyncio
-async def test_global_on_mailbox_row_absent_returns_false() -> None:
-    """Global ON but mailbox row absent → False (mailbox not opted in)."""
+async def test_tenant_on_mailbox_missing_returns_true() -> None:
+    """Tenant ON, no per-mailbox row → True (tenant default applies)."""
     clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True), mailbox_row=None))
-    assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
+    assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
 
 
 @pytest.mark.asyncio
-async def test_global_on_mailbox_disabled_returns_false() -> None:
-    """Global ON but mailbox row enabled=False → False."""
+async def test_tenant_on_mailbox_off_returns_false() -> None:
+    """Tenant ON, mailbox OFF → False (per-mailbox kill-switch)."""
     clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True), mailbox_row=_row(False)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
@@ -117,7 +154,7 @@ async def test_global_on_mailbox_disabled_returns_false() -> None:
 
 @pytest.mark.asyncio
 async def test_both_on_returns_true() -> None:
-    """Global ON + mailbox ON → True."""
+    """Tenant ON + mailbox ON → True."""
     clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True), mailbox_row=_row(True)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
@@ -395,8 +432,8 @@ async def test_sqla_adapter_basic_resolution() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sqla_adapter_absent_mailbox_row_returns_false() -> None:
-    """SQLAPoolAdapter: absent mailbox row → False."""
+async def test_sqla_adapter_tenant_on_no_mailbox_row_returns_true() -> None:
+    """SQLAPoolAdapter: tenant ON + no mailbox row → True (tenant default applies)."""
     pytest.importorskip("sqlalchemy")
     pytest.importorskip("aiosqlite")
 
@@ -422,11 +459,53 @@ async def test_sqla_adapter_absent_mailbox_row_returns_false() -> None:
             )
         )
         await conn.execute(text("INSERT INTO feature_flags VALUES ('f2', '', 1, '{}')"))
-        # NO mailbox row.
+        # NO mailbox row — under override semantics, tenant default applies.
 
     clear_flag_cache()
     svc = FeatureFlagService(SQLAPoolAdapter(Session))
     result = await svc.is_enabled("f2", "inbox@test.de")
-    assert result is False
+    assert result is True
+
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sqla_adapter_mailbox_overrides_tenant_off() -> None:
+    """SQLAPoolAdapter: tenant OFF + mailbox ON → True (override)."""
+    pytest.importorskip("sqlalchemy")
+    pytest.importorskip("aiosqlite")
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from feature_flags._sqla_adapter import SQLAPoolAdapter
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE feature_flags (
+                    flag_name TEXT NOT NULL,
+                    mailbox_address TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    config TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+        )
+        # Tenant row OFF.
+        await conn.execute(text("INSERT INTO feature_flags VALUES ('f3', '', 0, '{}')"))
+        # Mailbox row ON — should override tenant OFF.
+        await conn.execute(
+            text("INSERT INTO feature_flags VALUES ('f3', 'inbox@test.de', 1, '{}')")
+        )
+
+    clear_flag_cache()
+    svc = FeatureFlagService(SQLAPoolAdapter(Session))
+    result = await svc.is_enabled("f3", "inbox@test.de")
+    assert result is True
 
     await engine.dispose()

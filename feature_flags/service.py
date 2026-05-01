@@ -1,11 +1,26 @@
 """FeatureFlagService — shared feature flag resolution for Alea services.
 
-Resolution semantics (strict AND, fail-closed):
-    1. Tenant-wide row (mailbox_address = '') must exist AND have enabled = True.
-    2. If a mailbox is provided, the per-mailbox row must ALSO exist AND be enabled.
-    3. Any missing row or disabled value → False.
+Resolution semantics (mailbox-overrides-tenant, fail-closed):
+    1. If a mailbox is provided AND a per-mailbox row exists, that row's
+       `enabled` value wins (regardless of the tenant-wide row).
+    2. Otherwise, if the tenant-wide row (mailbox_address = '') exists, its
+       `enabled` value wins.
+    3. If neither row is present → False (fail-closed).
     4. Any DB/pool error → False (never re-raised; logged as WARNING).
     5. Mailbox matching is case-insensitive.
+
+Truth-table:
+    | tenant row | mailbox row | resolved |
+    |------------|-------------|----------|
+    | missing    | missing     | False    |
+    | missing    | OFF         | False    |
+    | missing    | ON          | True     |  ← mailbox can opt-in alone
+    | OFF        | missing     | False    |
+    | OFF        | OFF         | False    |
+    | OFF        | ON          | True     |  ← mailbox overrides tenant OFF
+    | ON         | missing     | True     |  ← tenant default applies
+    | ON         | OFF         | False    |  ← per-mailbox kill-switch
+    | ON         | ON          | True     |
 
 Config merge (shallow, mailbox keys override tenant defaults):
     merged = {**tenant_row.config, **mailbox_row.config}
@@ -84,9 +99,12 @@ class FeatureFlagService:
     ) -> bool:
         """Return True iff the flag is enabled for the given mailbox.
 
-        Both the global (mailbox='') row AND the per-mailbox row (if mailbox
-        is supplied) must be explicitly enabled.  Any absent or disabled row
-        returns False.  DB errors are caught and return False (fail-closed).
+        Resolution order (override semantics):
+          1. If a mailbox is supplied AND a per-mailbox row exists, that row
+             wins (even if the tenant-wide row is missing or disabled).
+          2. Otherwise the tenant-wide row's ``enabled`` value applies.
+          3. If neither row exists → False (fail-closed).
+        DB errors are caught and return False (fail-closed).
         """
         cache_key = (flag_name, (mailbox or "").lower())
         cached = _FLAG_CACHE.get(cache_key)
@@ -153,34 +171,47 @@ class FeatureFlagService:
     ) -> tuple[bool, dict[str, Any]]:
         """Query DB; return (enabled, merged_config).
 
+        Override semantics: the per-mailbox row (if present) wins over the
+        tenant row. Otherwise the tenant row applies. Missing both → False.
+
         Raises on DB error (caller catches and returns fail-closed False).
         """
         async with self._pool.acquire() as conn:
-            # Step 1: tenant-wide row (mailbox_address = '') must be ON.
+            # Always read the tenant-wide row (mailbox_address = '') first;
+            # its config is the base layer for the merged config dict.
             tenant_row = await conn.fetchrow(
                 "SELECT enabled, config FROM feature_flags"
                 " WHERE flag_name = $1 AND mailbox_address = ''",
                 flag_name,
             )
-            if tenant_row is None or not tenant_row["enabled"]:
-                return False, {}
+            tenant_enabled: bool = bool(tenant_row["enabled"]) if tenant_row else False
+            tenant_config: dict[str, Any] = _to_dict(tenant_row["config"]) if tenant_row else {}
 
-            tenant_config: dict[str, Any] = _to_dict(tenant_row["config"])
-
-            # Step 2 (conditional): per-mailbox row must ALSO be ON.
+            # If no mailbox supplied, the tenant row alone decides.
             if not mailbox:
-                return True, tenant_config
+                if tenant_row is None:
+                    return False, {}
+                return tenant_enabled, tenant_config if tenant_enabled else {}
 
+            # Mailbox supplied — the per-mailbox row (if present) wins.
             mailbox_row = await conn.fetchrow(
                 "SELECT enabled, config FROM feature_flags"
                 " WHERE flag_name = $1 AND lower(mailbox_address) = lower($2)",
                 flag_name,
                 mailbox,
             )
-            if mailbox_row is None or not mailbox_row["enabled"]:
-                return False, {}
 
-            mailbox_config: dict[str, Any] = _to_dict(mailbox_row["config"])
-            # Shallow merge: mailbox keys override tenant defaults.
-            merged = {**tenant_config, **mailbox_config}
-            return True, merged
+            if mailbox_row is not None:
+                mailbox_enabled = bool(mailbox_row["enabled"])
+                mailbox_config: dict[str, Any] = _to_dict(mailbox_row["config"])
+                if not mailbox_enabled:
+                    # Per-mailbox kill-switch wins, regardless of tenant.
+                    return False, {}
+                # Shallow merge: mailbox keys override tenant defaults.
+                merged = {**tenant_config, **mailbox_config}
+                return True, merged
+
+            # No mailbox row → fall back to tenant row.
+            if tenant_row is None:
+                return False, {}
+            return tenant_enabled, tenant_config if tenant_enabled else {}

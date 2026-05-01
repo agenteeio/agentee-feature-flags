@@ -1,0 +1,40 @@
+[project]
+name = "agentee-feature-flags"
+version = "1.0.0"
+description = "Shared feature flag service for Alea backend services"
+requires-python = ">=3.11"
+dependencies = [
+    "loguru>=0.7.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Python module is the nested feature_flags/ subdirectory.
+packages = ["feature_flags"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "UP"]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=6.0.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20.0",
+]

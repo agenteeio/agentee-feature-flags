@@ -1,6 +1,6 @@
 [project]
 name = "agentee-feature-flags"
-version = "2.0.0"
+version = "3.0.0"
 description = "Shared feature flag service for Alea backend services"
 requires-python = ">=3.11"
 dependencies = [

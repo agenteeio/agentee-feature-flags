@@ -23,6 +23,7 @@ Covers:
     - DB error → False, NOT cached
     - mailbox case-insensitivity
     - SQLAPoolAdapter (in-memory aiosqlite via SQLAlchemy)
+    - per-instance cache isolation (regression for ISSUE-891 cross-tenant poisoning)
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from feature_flags.service import _FLAG_CACHE, FeatureFlagService, clear_flag_cache
+from feature_flags.service import FeatureFlagService
 
 # ---------------------------------------------------------------------------
 # asyncpg-style mock pool builder
@@ -83,7 +84,6 @@ def _make_pool(
 @pytest.mark.asyncio
 async def test_no_rows_returns_false() -> None:
     """Neither tenant nor mailbox row exists → False (fail-closed)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=None, mailbox_row=None))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
 
@@ -91,7 +91,6 @@ async def test_no_rows_returns_false() -> None:
 @pytest.mark.asyncio
 async def test_tenant_missing_mailbox_off_returns_false() -> None:
     """Tenant row missing, mailbox OFF → False (mailbox row decides)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=None, mailbox_row=_row(False)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
 
@@ -99,7 +98,6 @@ async def test_tenant_missing_mailbox_off_returns_false() -> None:
 @pytest.mark.asyncio
 async def test_tenant_missing_mailbox_on_returns_true() -> None:
     """Tenant row missing, mailbox ON → True (mailbox can opt-in alone)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=None, mailbox_row=_row(True)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
 
@@ -107,7 +105,6 @@ async def test_tenant_missing_mailbox_on_returns_true() -> None:
 @pytest.mark.asyncio
 async def test_tenant_off_no_mailbox_returns_false() -> None:
     """Tenant OFF, no mailbox supplied → False (tenant row decides)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(False)))
     assert await svc.is_enabled("auto_execute.invoice_v1") is False
 
@@ -115,7 +112,6 @@ async def test_tenant_off_no_mailbox_returns_false() -> None:
 @pytest.mark.asyncio
 async def test_tenant_off_mailbox_off_returns_false() -> None:
     """Tenant OFF, mailbox OFF → False (mailbox row decides — and it's OFF)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(False), mailbox_row=_row(False)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
 
@@ -123,7 +119,6 @@ async def test_tenant_off_mailbox_off_returns_false() -> None:
 @pytest.mark.asyncio
 async def test_tenant_off_mailbox_on_returns_true() -> None:
     """Tenant OFF, mailbox ON → True (mailbox overrides tenant OFF)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(False), mailbox_row=_row(True)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
 
@@ -131,7 +126,6 @@ async def test_tenant_off_mailbox_on_returns_true() -> None:
 @pytest.mark.asyncio
 async def test_tenant_on_no_mailbox_returns_true() -> None:
     """Tenant ON and no mailbox supplied → True."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True)))
     assert await svc.is_enabled("auto_execute.invoice_v1") is True
 
@@ -139,7 +133,6 @@ async def test_tenant_on_no_mailbox_returns_true() -> None:
 @pytest.mark.asyncio
 async def test_tenant_on_mailbox_missing_returns_true() -> None:
     """Tenant ON, no per-mailbox row → True (tenant default applies)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True), mailbox_row=None))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
 
@@ -147,7 +140,6 @@ async def test_tenant_on_mailbox_missing_returns_true() -> None:
 @pytest.mark.asyncio
 async def test_tenant_on_mailbox_off_returns_false() -> None:
     """Tenant ON, mailbox OFF → False (per-mailbox kill-switch)."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True), mailbox_row=_row(False)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is False
 
@@ -155,7 +147,6 @@ async def test_tenant_on_mailbox_off_returns_false() -> None:
 @pytest.mark.asyncio
 async def test_both_on_returns_true() -> None:
     """Tenant ON + mailbox ON → True."""
-    clear_flag_cache()
     svc = FeatureFlagService(_make_pool(tenant_row=_row(True), mailbox_row=_row(True)))
     assert await svc.is_enabled("auto_execute.invoice_v1", "inbox@test.de") is True
 
@@ -168,7 +159,6 @@ async def test_both_on_returns_true() -> None:
 @pytest.mark.asyncio
 async def test_mailbox_cache_key_is_lowercased() -> None:
     """Cache key uses lower(mailbox) so mixed-case matches the same entry."""
-    clear_flag_cache()
     pool = _make_pool(tenant_row=_row(True), mailbox_row=_row(True))
     svc = FeatureFlagService(pool)
 
@@ -191,7 +181,6 @@ async def test_mailbox_cache_key_is_lowercased() -> None:
 @pytest.mark.asyncio
 async def test_cache_hit_skips_db() -> None:
     """Second call for same (flag, mailbox) returns cached value — no DB call."""
-    clear_flag_cache()
     pool = _make_pool(tenant_row=_row(True), mailbox_row=_row(True))
     svc = FeatureFlagService(pool)
 
@@ -206,18 +195,35 @@ async def test_cache_hit_skips_db() -> None:
 @pytest.mark.asyncio
 async def test_expired_cache_triggers_fresh_db_call() -> None:
     """After TTL expires, the next call re-queries the DB."""
-    clear_flag_cache()
     pool = _make_pool(tenant_row=_row(True), mailbox_row=_row(True))
     svc = FeatureFlagService(pool)
 
     await svc.is_enabled("flag_ttl", "inbox@ttl.de")
     first_call_count = pool.acquire.call_count  # type: ignore[attr-defined]
 
-    # Manually expire the cache entry.
+    # Manually expire the cache entry on this instance.
     key = ("flag_ttl", "inbox@ttl.de")
-    _FLAG_CACHE[key] = (True, {}, time.monotonic() - 1.0)
+    svc._cache[key] = (True, {}, time.monotonic() - 1.0)
 
     await svc.is_enabled("flag_ttl", "inbox@ttl.de")
+    assert pool.acquire.call_count > first_call_count  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_clear_cache_invalidates_instance_cache() -> None:
+    """clear_cache() drops cached entries on the instance, forcing a DB re-query."""
+    pool = _make_pool(tenant_row=_row(True), mailbox_row=_row(True))
+    svc = FeatureFlagService(pool)
+
+    await svc.is_enabled("flag_cc", "inbox@cc.de")
+    assert ("flag_cc", "inbox@cc.de") in svc._cache
+
+    svc.clear_cache()
+    assert svc._cache == {}
+
+    first_call_count = pool.acquire.call_count  # type: ignore[attr-defined]
+    await svc.is_enabled("flag_cc", "inbox@cc.de")
+    # Cache was cleared, so the next call must hit the DB again.
     assert pool.acquire.call_count > first_call_count  # type: ignore[attr-defined]
 
 
@@ -229,8 +235,6 @@ async def test_expired_cache_triggers_fresh_db_call() -> None:
 @pytest.mark.asyncio
 async def test_db_error_returns_false_and_is_not_cached() -> None:
     """DB error → return False; result NOT cached so flag recovers on next call."""
-    clear_flag_cache()
-
     conn = MagicMock()
     conn.fetchrow = AsyncMock(side_effect=RuntimeError("DB unavailable"))
 
@@ -247,7 +251,7 @@ async def test_db_error_returns_false_and_is_not_cached() -> None:
 
     # Nothing in cache — next call will retry DB.
     key = ("flag_err", "inbox@err.de")
-    assert key not in _FLAG_CACHE
+    assert key not in svc._cache
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +262,6 @@ async def test_db_error_returns_false_and_is_not_cached() -> None:
 @pytest.mark.asyncio
 async def test_get_config_shallow_merge() -> None:
     """get_config returns tenant defaults with mailbox overrides merged in."""
-    clear_flag_cache()
     tenant_cfg = {"threshold": 0.9, "mode": "strict"}
     mailbox_cfg = {"threshold": 0.7}  # overrides tenant threshold
     pool = _make_pool(
@@ -273,7 +276,6 @@ async def test_get_config_shallow_merge() -> None:
 @pytest.mark.asyncio
 async def test_get_config_tenant_only_when_no_mailbox() -> None:
     """get_config with no mailbox returns tenant config only."""
-    clear_flag_cache()
     tenant_cfg = {"x": 1}
     pool = _make_pool(tenant_row=_row(True, tenant_cfg))
     svc = FeatureFlagService(pool)
@@ -284,7 +286,6 @@ async def test_get_config_tenant_only_when_no_mailbox() -> None:
 @pytest.mark.asyncio
 async def test_get_config_disabled_returns_empty() -> None:
     """get_config returns {} when flag is disabled."""
-    clear_flag_cache()
     pool = _make_pool(tenant_row=_row(False))
     svc = FeatureFlagService(pool)
     cfg = await svc.get_config("some_flag", "inbox@test.de")
@@ -292,9 +293,23 @@ async def test_get_config_disabled_returns_empty() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_config_cache_hit_skips_db() -> None:
+    """Second get_config call for same key is served from per-instance cache."""
+    tenant_cfg = {"x": 1}
+    pool = _make_pool(tenant_row=_row(True, tenant_cfg))
+    svc = FeatureFlagService(pool)
+
+    cfg1 = await svc.get_config("flag_gc", "inbox@gc.de")
+    first_call_count = pool.acquire.call_count  # type: ignore[attr-defined]
+
+    cfg2 = await svc.get_config("flag_gc", "inbox@gc.de")
+    assert cfg1 == cfg2
+    assert pool.acquire.call_count == first_call_count  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
 async def test_get_config_db_error_returns_empty() -> None:
     """get_config returns {} on DB error."""
-    clear_flag_cache()
     conn = MagicMock()
     conn.fetchrow = AsyncMock(side_effect=RuntimeError("boom"))
 
@@ -308,6 +323,92 @@ async def test_get_config_db_error_returns_empty() -> None:
     svc = FeatureFlagService(pool)
     cfg = await svc.get_config("some_flag", "inbox@x.de")
     assert cfg == {}
+
+
+# ---------------------------------------------------------------------------
+# Cross-tenant cache isolation (regression for ISSUE-891)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_per_instance_cache_isolation_no_cross_tenant_poisoning() -> None:
+    """Regression for ISSUE-891.
+
+    Before v0.3.0, _FLAG_CACHE was a module-global dict keyed only on
+    (flag, mailbox). Two FeatureFlagService instances backed by different
+    tenant pools would share the cache: tenant A's cached value would leak
+    into tenant B's lookup with the same (flag, mailbox) key.
+
+    With per-instance cache, each FeatureFlagService keeps its own values.
+    Tenant A's cache must NOT influence tenant B's resolution, even when
+    the (flag, mailbox) key is identical.
+    """
+    # Tenant A has the flag ENABLED tenant-wide.
+    tenant_a_pool = _make_pool(tenant_row=_row(True), mailbox_row=None)
+    # Tenant B has the flag DISABLED tenant-wide.
+    tenant_b_pool = _make_pool(tenant_row=_row(False), mailbox_row=None)
+
+    svc_a = FeatureFlagService(tenant_a_pool)
+    svc_b = FeatureFlagService(tenant_b_pool)
+
+    # Resolve via tenant A first — caches True against (flag, '').
+    assert await svc_a.is_enabled("shared_flag") is True
+
+    # Tenant B must resolve from its own pool (False), NOT from A's cache.
+    assert await svc_b.is_enabled("shared_flag") is False
+
+    # Verify caches are physically distinct dicts.
+    assert svc_a._cache is not svc_b._cache
+    assert ("shared_flag", "") in svc_a._cache
+    assert ("shared_flag", "") in svc_b._cache
+    # Confirm each cache contains its own tenant's resolved value.
+    assert svc_a._cache[("shared_flag", "")][0] is True
+    assert svc_b._cache[("shared_flag", "")][0] is False
+
+    # Tenant B's pool must have been queried (cache was NOT poisoned by A).
+    assert tenant_b_pool.acquire.call_count == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_per_instance_cache_isolation_with_mailbox() -> None:
+    """Regression for ISSUE-891 with a mailbox-keyed lookup.
+
+    Two tenants both have a mailbox row for the same address (rare but
+    possible during a migration / re-onboarding). The cached value from
+    one tenant must never be returned for the other.
+    """
+    tenant_a_pool = _make_pool(tenant_row=None, mailbox_row=_row(True))
+    tenant_b_pool = _make_pool(tenant_row=None, mailbox_row=_row(False))
+
+    svc_a = FeatureFlagService(tenant_a_pool)
+    svc_b = FeatureFlagService(tenant_b_pool)
+
+    assert await svc_a.is_enabled("shared_flag", "shared@inbox.de") is True
+    assert await svc_b.is_enabled("shared_flag", "shared@inbox.de") is False
+
+    # Both pools were queried independently — no shared cache.
+    assert tenant_a_pool.acquire.call_count == 1  # type: ignore[attr-defined]
+    assert tenant_b_pool.acquire.call_count == 1  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_clear_cache_does_not_affect_other_instances() -> None:
+    """clear_cache() on one instance must not invalidate another instance's cache."""
+    pool_a = _make_pool(tenant_row=_row(True))
+    pool_b = _make_pool(tenant_row=_row(True))
+
+    svc_a = FeatureFlagService(pool_a)
+    svc_b = FeatureFlagService(pool_b)
+
+    await svc_a.is_enabled("f")
+    await svc_b.is_enabled("f")
+    assert ("f", "") in svc_a._cache
+    assert ("f", "") in svc_b._cache
+
+    svc_a.clear_cache()
+    assert svc_a._cache == {}
+    # B's cache must still have its entry.
+    assert ("f", "") in svc_b._cache
 
 
 # ---------------------------------------------------------------------------
@@ -423,7 +524,6 @@ async def test_sqla_adapter_basic_resolution() -> None:
             text("INSERT INTO feature_flags VALUES ('test_flag', 'inbox@test.de', 1, '{}')")
         )
 
-    clear_flag_cache()
     svc = FeatureFlagService(SQLAPoolAdapter(Session))
     result = await svc.is_enabled("test_flag", "inbox@test.de")
     assert result is True
@@ -461,7 +561,6 @@ async def test_sqla_adapter_tenant_on_no_mailbox_row_returns_true() -> None:
         await conn.execute(text("INSERT INTO feature_flags VALUES ('f2', '', 1, '{}')"))
         # NO mailbox row — under override semantics, tenant default applies.
 
-    clear_flag_cache()
     svc = FeatureFlagService(SQLAPoolAdapter(Session))
     result = await svc.is_enabled("f2", "inbox@test.de")
     assert result is True
@@ -503,7 +602,6 @@ async def test_sqla_adapter_mailbox_overrides_tenant_off() -> None:
             text("INSERT INTO feature_flags VALUES ('f3', 'inbox@test.de', 1, '{}')")
         )
 
-    clear_flag_cache()
     svc = FeatureFlagService(SQLAPoolAdapter(Session))
     result = await svc.is_enabled("f3", "inbox@test.de")
     assert result is True

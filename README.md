@@ -3,6 +3,18 @@
 Shared feature-flag library for Alea backend services (email-planner-agent,
 communication-agent, inbox-sorting-agent).
 
+## Cache scoping (v0.3.0+)
+
+The 60-second TTL cache is **per-instance**: each `FeatureFlagService`
+keeps its own `_cache` dict. Construct **one service per tenant pool**.
+Sharing a single instance across tenants will silently poison the cache
+(see ISSUE-891 — fixed in v0.3.0). Prior to v0.3.0 the cache was a module
+global keyed only on `(flag, mailbox)`, which leaked values across
+tenants that happened to share a key.
+
+Use `service.clear_cache()` (instance method) to invalidate. The
+module-level `clear_flag_cache()` helper was **removed** in v0.3.0.
+
 ## Resolution semantics
 
 `FeatureFlagService` uses **mailbox-overrides-tenant** semantics and is
@@ -80,7 +92,7 @@ Pin to a tag via Git URL in your service's `pyproject.toml`:
 ```toml
 [project]
 dependencies = [
-    "agentee-feature-flags @ git+https://github.com/agenteeio/agentee-feature-flags.git@v0.2.0",
+    "agentee-feature-flags @ git+https://github.com/agenteeio/agentee-feature-flags.git@v0.3.0",
 ]
 ```
 

@@ -27,8 +27,14 @@ Config merge (shallow, mailbox keys override tenant defaults):
 
 Cache:
     60-second TTL per (flag_name, lower(mailbox_address|'')) key.
+    The cache is **scoped to the FeatureFlagService instance** so per-tenant
+    services never share cached values across tenants. Construct one
+    FeatureFlagService per tenant pool — never share an instance across
+    tenants.
+
     Dict operations are GIL-atomic for single keys — no asyncio.Lock needed.
-    Error results are NOT cached so the flag recovers after transient DB failures.
+    Error results are NOT cached so the flag recovers after transient DB
+    failures.
 """
 
 from __future__ import annotations
@@ -40,14 +46,6 @@ from typing import Any
 from loguru import logger
 
 FLAG_CACHE_TTL_S: float = 60.0
-
-# Cache: (flag_name, lower(mailbox_address or '')) → (enabled, config, expires_at)
-_FLAG_CACHE: dict[tuple[str, str], tuple[bool, dict[str, Any], float]] = {}
-
-
-def clear_flag_cache() -> None:
-    """Invalidate the entire cache (used in tests and admin endpoints)."""
-    _FLAG_CACHE.clear()
 
 
 def _mailbox_hash(mailbox: str | None) -> str | None:
@@ -87,10 +85,22 @@ class FeatureFlagService:
 
     For SQLAlchemy-backed services, wrap the engine/session with
     ``_sqla_adapter.SQLAPoolAdapter`` before passing it here.
+
+    The 60-second TTL cache is **per-instance**: each FeatureFlagService
+    keeps its own ``_cache`` dict. Construct one service per tenant pool so
+    cached flag values cannot leak across tenants. Sharing a single instance
+    across tenants will silently poison the cache (ISSUE-891).
     """
 
     def __init__(self, pool: Any) -> None:
         self._pool = pool
+        # Cache: (flag_name, lower(mailbox_address or '')) → (enabled, config, expires_at)
+        # Instance-scoped so per-tenant services never share cached values.
+        self._cache: dict[tuple[str, str], tuple[bool, dict[str, Any], float]] = {}
+
+    def clear_cache(self) -> None:
+        """Invalidate this instance's cache (used in tests and admin endpoints)."""
+        self._cache.clear()
 
     async def is_enabled(
         self,
@@ -107,7 +117,7 @@ class FeatureFlagService:
         DB errors are caught and return False (fail-closed).
         """
         cache_key = (flag_name, (mailbox or "").lower())
-        cached = _FLAG_CACHE.get(cache_key)
+        cached = self._cache.get(cache_key)
         if cached is not None:
             enabled, _, expires_at = cached
             if time.monotonic() < expires_at:
@@ -125,7 +135,7 @@ class FeatureFlagService:
             # Do NOT cache errors — flag must recover after transient failures.
             return False
 
-        _FLAG_CACHE[cache_key] = (result, config, time.monotonic() + FLAG_CACHE_TTL_S)
+        self._cache[cache_key] = (result, config, time.monotonic() + FLAG_CACHE_TTL_S)
         logger.debug(
             "feature_flag_resolved",
             flag=flag_name,
@@ -144,7 +154,7 @@ class FeatureFlagService:
         Returns ``{}`` if the flag is disabled or does not exist.
         """
         cache_key = (flag_name, (mailbox or "").lower())
-        cached = _FLAG_CACHE.get(cache_key)
+        cached = self._cache.get(cache_key)
         if cached is not None:
             _, config, expires_at = cached
             if time.monotonic() < expires_at:
@@ -161,7 +171,7 @@ class FeatureFlagService:
             )
             return {}
 
-        _FLAG_CACHE[cache_key] = (enabled, config, time.monotonic() + FLAG_CACHE_TTL_S)
+        self._cache[cache_key] = (enabled, config, time.monotonic() + FLAG_CACHE_TTL_S)
         return config
 
     async def _resolve(

@@ -36,3 +36,6 @@ coverage.xml
 
 # Claude Code session tracking
 .claude/
+
+# Claude Code session tracking (regenerated each session)
+.claude/session-modified-files.txt

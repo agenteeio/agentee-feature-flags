@@ -3,12 +3,12 @@
 Shared feature-flag library for Alea backend services (email-planner-agent,
 communication-agent, inbox-sorting-agent).
 
-## Cache scoping (v0.3.0+)
+## Cache scoping
 
 The 60-second TTL cache is **per-instance**: each `FeatureFlagService`
 keeps its own `_cache` dict. Construct **one service per tenant pool**.
 Sharing a single instance across tenants will silently poison the cache
-(see ISSUE-891 — fixed in v0.3.0). Prior to v0.3.0 the cache was a module
+(see ISSUE-891; fixed in the v0.3.0 release tag). Prior to that fix, the cache was a module
 global keyed only on `(flag, mailbox)`, which leaked values across
 tenants that happened to share a key.
 
@@ -87,7 +87,7 @@ service = FeatureFlagService(SQLAPoolAdapter(async_engine))
 
 ## Installing as a dependency
 
-Pin to a tag via Git URL in your service's `pyproject.toml`:
+Pin to a release tag via Git URL in your service's `pyproject.toml`:
 
 ```toml
 [project]

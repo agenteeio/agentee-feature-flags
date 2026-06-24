@@ -4,8 +4,12 @@ version = "3.0.0"
 description = "Shared feature flag service for Alea backend services"
 requires-python = ">=3.11"
 dependencies = [
+    "asyncpg>=0.29.0",
     "loguru>=0.7.0",
 ]
+
+[project.scripts]
+agentee = "feature_flags.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -85,6 +85,31 @@ from feature_flags._sqla_adapter import SQLAPoolAdapter
 service = FeatureFlagService(SQLAPoolAdapter(async_engine))
 ```
 
+## Graduation CLI
+
+The package also installs an `agentee` console command. Use
+`agentee flags graduate` after a human go/no-go has approved a flag graduation.
+The command appends the audit/tombstone row in `feature_flag_graduations`,
+deletes live `feature_flags` rows for that flag, and marks lifecycle metadata as
+graduated when the metadata table exists.
+
+```bash
+agentee flags graduate oi_tiered_interpreter \
+  --database-url "$DATABASE_URL" \
+  --owning-service email-planner-agent \
+  --owner "Alea Platform" \
+  --introduced-issue ISSUE-845 \
+  --graduation-evidence "QA eval/run links and human go/no-go" \
+  --cleanup-ticket ISSUE-1314 \
+  --seed-location src/app/infrastructure/database.py:_FF_SEED_CANONICAL \
+  --runtime-call-site src/app/services/plan_operation_interpreter.py \
+  --yes
+```
+
+`--yes` is required because the command deletes the active `feature_flags` rows
+after writing the append-only graduation ledger row. Re-running the same command
+is safe when the default or supplied `--dedupe-key` is unchanged.
+
 ## Installing as a dependency
 
 Pin to a tag via Git URL in your service's `pyproject.toml`:

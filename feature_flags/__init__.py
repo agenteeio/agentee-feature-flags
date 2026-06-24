@@ -11,6 +11,7 @@ Cache invalidation:
 
 from __future__ import annotations
 
+from feature_flags.graduation import FeatureFlagGraduation, GraduationResult
 from feature_flags.service import FeatureFlagService
 
-__all__ = ["FeatureFlagService"]
+__all__ = ["FeatureFlagGraduation", "FeatureFlagService", "GraduationResult"]

@@ -96,6 +96,13 @@ async def test_tenant_missing_mailbox_off_returns_false() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tenant_missing_no_mailbox_returns_false() -> None:
+    """Tenant row missing and no mailbox supplied -> False."""
+    svc = FeatureFlagService(_make_pool(tenant_row=None))
+    assert await svc.is_enabled("auto_execute.invoice_v1") is False
+
+
+@pytest.mark.asyncio
 async def test_tenant_missing_mailbox_on_returns_true() -> None:
     """Tenant row missing, mailbox ON → True (mailbox can opt-in alone)."""
     svc = FeatureFlagService(_make_pool(tenant_row=None, mailbox_row=_row(True)))
@@ -607,3 +614,32 @@ async def test_sqla_adapter_mailbox_overrides_tenant_off() -> None:
     assert result is True
 
     await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sqla_adapter_fetch_and_raw_session_branch() -> None:
+    """SQLAPoolAdapter supports raw sessions and multi-row fetch."""
+    pytest.importorskip("sqlalchemy")
+    pytest.importorskip("aiosqlite")
+
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from feature_flags._sqla_adapter import SQLAPoolAdapter
+
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    Session = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.execute(text("CREATE TABLE rows (name TEXT NOT NULL)"))
+        await conn.execute(text("INSERT INTO rows VALUES ('a'), ('b')"))
+
+    session = Session()
+    try:
+        async with SQLAPoolAdapter(session).acquire() as conn:
+            rows = await conn.fetch("SELECT name FROM rows WHERE name IN ($1, $2)", "a", "b")
+    finally:
+        await session.close()
+        await engine.dispose()
+
+    assert rows == [{"name": "a"}, {"name": "b"}]

@@ -44,7 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     graduate.add_argument("--seed-location", action="append", default=[])
     graduate.add_argument("--runtime-call-site", action="append", default=[])
     graduate.add_argument("--ship-engine-allowlist", action="append", default=[])
-    graduate.add_argument("--db-cleanup-required", action="store_true")
+    graduate.add_argument(
+        "--db-cleanup-required",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     graduate.add_argument("--rollback-note")
     graduate.add_argument("--recorded-by", default="agentee-cli")
     graduate.add_argument("--tombstone-reason")

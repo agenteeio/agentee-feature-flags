@@ -148,6 +148,11 @@ async def record_feature_flag_graduation(
                     """,
                     item.dedupe_key,
                 )
+                if row is not None and row.get("flag_name") != item.flag_name:
+                    raise ValueError(
+                        "dedupe_key already belongs to a different feature flag: "
+                        f"{row.get('flag_name')}"
+                    )
             deleted_status = await conn.execute(
                 "DELETE FROM feature_flags WHERE flag_name = $1",
                 item.flag_name,

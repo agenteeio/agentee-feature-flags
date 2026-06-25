@@ -140,6 +140,27 @@ async def test_record_feature_flag_graduation_is_idempotent_by_dedupe_key() -> N
 
 
 @pytest.mark.asyncio
+async def test_record_feature_flag_graduation_rejects_cross_flag_dedupe_conflict() -> None:
+    """A dedupe-key collision for a different flag must not delete the requested flag."""
+
+    existing = {
+        "id": 8,
+        "flag_name": "other_flag",
+        "rollout_state": "removed",
+        "dedupe_key": "shared-key",
+    }
+    conn = _FakeConnection(row=None, existing_row=existing)
+
+    with pytest.raises(ValueError, match="different feature flag"):
+        await record_feature_flag_graduation(
+            _FakePool(conn),
+            _graduation(flag_name="qa_only_flag", dedupe_key="shared-key"),
+        )
+
+    assert not any("DELETE FROM feature_flags" in sql for sql, _ in conn.statements or [])
+
+
+@pytest.mark.asyncio
 async def test_record_feature_flag_graduation_raises_when_conflict_row_is_missing() -> None:
     """A broken DB response is surfaced instead of pretending graduation succeeded."""
     with pytest.raises(RuntimeError):
@@ -194,6 +215,7 @@ def test_cli_parser_builds_graduate_namespace() -> None:
     assert args.command == "flags"
     assert args.flags_command == "graduate"
     assert args.flag_default is False
+    assert args.db_cleanup_required is True
     assert args.delete_by == date(2026, 7, 31)
     assert args.seed_location == ["seed.py"]
 
